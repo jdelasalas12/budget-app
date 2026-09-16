@@ -98,6 +98,26 @@ export default function DashboardNavigation() {
         </div>
       </aside>
 
+      {/* Mobile Settings / Logout */}
+      <div className="fixed right-4 top-4 z-40 flex items-center gap-2 md:hidden">
+        <Link
+          href="/settings"
+          aria-label="Settings"
+          className="flex h-10 w-10 items-center justify-center rounded-full border border-gray-200 bg-white text-lg shadow-sm"
+        >
+          ⚙
+        </Link>
+
+        <button
+          type="button"
+          onClick={handleLogout}
+          aria-label="Logout"
+          className="flex h-10 w-10 items-center justify-center rounded-full border border-red-100 bg-white text-lg text-red-500 shadow-sm"
+        >
+          ↪
+        </button>
+      </div>
+
       {/* Mobile Bottom Navigation */}
       <nav className="fixed inset-x-0 bottom-0 z-50 border-t border-gray-200 bg-white/95 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-2 backdrop-blur md:hidden">
         <div className="mx-auto grid max-w-md grid-cols-5">
