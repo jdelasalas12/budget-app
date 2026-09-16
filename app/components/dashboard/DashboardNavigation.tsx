@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { logoutUser } from "@/lib/auth";
@@ -34,8 +35,10 @@ const navigation = [
 
 export default function DashboardNavigation() {
   const pathname = usePathname();
+  const [moreOpen, setMoreOpen] = useState(false);
 
   async function handleLogout() {
+    setMoreOpen(false);
     await logoutUser();
   }
 
@@ -93,35 +96,89 @@ export default function DashboardNavigation() {
             className="mt-1 flex w-full items-center gap-3 rounded-2xl px-4 py-3 text-sm font-medium text-red-500 hover:bg-red-50"
           >
             <span className="w-5 text-center">↪</span>
-            Logout
+            Sign out
           </button>
         </div>
       </aside>
 
-      {/* Mobile Settings / Logout */}
-      <div className="fixed right-4 top-4 z-40 flex items-center gap-2 md:hidden">
-        <Link
-          href="/settings"
-          aria-label="Settings"
-          className="flex h-10 w-10 items-center justify-center rounded-full border border-gray-200 bg-white text-lg shadow-sm"
-        >
-          ⚙
-        </Link>
+      {/* Mobile More Menu */}
+      {moreOpen && (
+        <>
+          {/* Backdrop */}
+          <button
+            type="button"
+            aria-label="Close menu"
+            onClick={() => setMoreOpen(false)}
+            className="fixed inset-0 z-40 bg-black/20 md:hidden"
+          />
 
-        <button
-          type="button"
-          onClick={handleLogout}
-          aria-label="Logout"
-          className="flex h-10 w-10 items-center justify-center rounded-full border border-red-100 bg-white text-lg text-red-500 shadow-sm"
-        >
-          ↪
-        </button>
-      </div>
+          {/* Menu */}
+          <div className="fixed bottom-[calc(5rem+env(safe-area-inset-bottom))] right-3 z-50 w-56 overflow-hidden rounded-2xl border border-gray-200 bg-white p-2 shadow-2xl md:hidden">
+            <div className="px-3 py-2">
+              <p className="text-xs font-medium uppercase tracking-wide text-gray-400">
+                Menu
+              </p>
+            </div>
+
+            <Link
+              href="/accounts"
+              onClick={() => setMoreOpen(false)}
+              className={`flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-medium ${
+                pathname === "/accounts"
+                  ? "bg-gray-100 text-black"
+                  : "text-gray-700 hover:bg-gray-50"
+              }`}
+            >
+              <span className="text-lg">▣</span>
+              Accounts
+            </Link>
+
+            <Link
+              href="/settings"
+              onClick={() => setMoreOpen(false)}
+              className={`flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-medium ${
+                pathname === "/settings"
+                  ? "bg-gray-100 text-black"
+                  : "text-gray-700 hover:bg-gray-50"
+              }`}
+            >
+              <span className="text-lg">⚙</span>
+              Settings
+            </Link>
+
+            <div className="my-1 border-t border-gray-100" />
+
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-medium text-red-600 hover:bg-red-50"
+            >
+              {/* Door + arrow style logout icon */}
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                <polyline points="16 17 21 12 16 7" />
+                <line x1="21" y1="12" x2="9" y2="12" />
+              </svg>
+              Sign out
+            </button>
+          </div>
+        </>
+      )}
 
       {/* Mobile Bottom Navigation */}
       <nav className="fixed inset-x-0 bottom-0 z-50 border-t border-gray-200 bg-white/95 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-2 backdrop-blur md:hidden">
         <div className="mx-auto grid max-w-md grid-cols-5">
-          {navigation.map((item) => {
+          {/* Dashboard */}
+          {navigation.slice(0, 3).map((item) => {
             const active = pathname === item.href;
 
             return (
@@ -138,6 +195,31 @@ export default function DashboardNavigation() {
               </Link>
             );
           })}
+
+          {/* Reports */}
+          <Link
+            href="/reports"
+            className={`flex flex-col items-center gap-1 rounded-xl py-2 text-[11px] font-medium ${
+              pathname === "/reports" ? "text-black" : "text-gray-400"
+            }`}
+          >
+            <span className="text-xl leading-none">◒</span>
+            <span>Reports</span>
+          </Link>
+
+          {/* More */}
+          <button
+            type="button"
+            onClick={() => setMoreOpen((open) => !open)}
+            className={`flex flex-col items-center gap-1 rounded-xl py-2 text-[11px] font-medium ${
+              moreOpen || pathname === "/accounts" || pathname === "/settings"
+                ? "text-black"
+                : "text-gray-400"
+            }`}
+          >
+            <span className="text-xl leading-none">•••</span>
+            <span>More</span>
+          </button>
         </div>
       </nav>
 
@@ -145,7 +227,7 @@ export default function DashboardNavigation() {
       <Link
         href="/transactions"
         aria-label="Add transaction"
-        className="fixed bottom-24 right-5 z-40 flex h-14 w-14 items-center justify-center rounded-full bg-black text-2xl text-white shadow-xl md:hidden"
+        className="fixed bottom-24 right-5 z-30 flex h-14 w-14 items-center justify-center rounded-full bg-black text-2xl text-white shadow-xl md:hidden"
       >
         +
       </Link>
