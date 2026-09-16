@@ -8,7 +8,8 @@ import type {
   UpdateBudgetInput,
 } from "@/types/budget";
 
-import { CURRENCIES, DEFAULT_CURRENCY } from "@/lib/currency";
+import { DEFAULT_CURRENCY } from "@/lib/currency";
+import { getUserCurrency } from "@/lib/auth";
 
 interface BudgetModalProps {
   open: boolean;
@@ -45,7 +46,10 @@ export default function BudgetModal({
   const [categoryName, setCategoryName] = useState("");
   const [amount, setAmount] = useState("");
   const [month, setMonth] = useState(getCurrentMonth());
+
+  // Currency comes from Settings.
   const [currency, setCurrency] = useState(DEFAULT_CURRENCY);
+  const [currencyLoading, setCurrencyLoading] = useState(false);
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -57,19 +61,54 @@ export default function BudgetModal({
       return;
     }
 
+    let cancelled = false;
+
+    async function loadCurrency() {
+      try {
+        setCurrencyLoading(true);
+
+        const savedCurrency = await getUserCurrency();
+
+        if (!cancelled) {
+          setCurrency(savedCurrency || DEFAULT_CURRENCY);
+        }
+      } catch (err) {
+        console.error("Unable to load currency:", err);
+
+        if (!cancelled) {
+          setCurrency(DEFAULT_CURRENCY);
+        }
+      } finally {
+        if (!cancelled) {
+          setCurrencyLoading(false);
+        }
+      }
+    }
+
+    setError("");
+
     if (budget) {
       setCategoryName(budget.categoryName);
       setAmount(String(budget.amount));
       setMonth(budget.month);
-      setCurrency(budget.currency);
+
+      /*
+       * Existing budgets keep their stored currency for compatibility.
+       *
+       * New budgets use the user's Settings currency.
+       */
+      setCurrency(budget.currency || DEFAULT_CURRENCY);
     } else {
       setCategoryName("");
       setAmount("");
       setMonth(getCurrentMonth());
-      setCurrency(DEFAULT_CURRENCY);
+
+      void loadCurrency();
     }
 
-    setError("");
+    return () => {
+      cancelled = true;
+    };
   }, [open, budget]);
 
   if (!open) {
@@ -96,6 +135,11 @@ export default function BudgetModal({
 
     if (!month) {
       setError("Please select a month.");
+      return;
+    }
+
+    if (!currency) {
+      setError("Unable to determine your currency. Please check Settings.");
       return;
     }
 
@@ -145,6 +189,8 @@ export default function BudgetModal({
         className="w-full max-w-lg overflow-hidden rounded-t-3xl bg-white shadow-2xl sm:rounded-3xl"
         onMouseDown={(event) => event.stopPropagation()}
       >
+        {/* HEADER */}
+
         <div className="flex items-center justify-between border-b border-gray-100 px-5 py-4 sm:px-6">
           <div>
             <h2 className="text-lg font-semibold text-gray-900">
@@ -170,11 +216,15 @@ export default function BudgetModal({
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-5 p-5 sm:p-6">
+          {/* ERROR */}
+
           {error && (
             <div className="rounded-2xl bg-red-50 px-4 py-3 text-sm text-red-600">
               {error}
             </div>
           )}
+
+          {/* CATEGORY */}
 
           <div>
             <label
@@ -201,6 +251,8 @@ export default function BudgetModal({
             </select>
           </div>
 
+          {/* AMOUNT */}
+
           <div>
             <label
               htmlFor="budget-amount"
@@ -209,19 +261,10 @@ export default function BudgetModal({
               Budget amount
             </label>
 
-            <div className="flex gap-2">
-              <select
-                value={currency}
-                onChange={(event) => setCurrency(event.target.value)}
-                disabled={saving}
-                className="rounded-2xl border border-gray-200 bg-gray-50 px-3 py-3 text-sm font-semibold outline-none focus:border-black disabled:opacity-50"
-              >
-                {CURRENCIES.map((item) => (
-                  <option key={item.code} value={item.code}>
-                    {item.code}
-                  </option>
-                ))}
-              </select>
+            <div className="flex overflow-hidden rounded-2xl border border-gray-200 bg-gray-50 focus-within:border-black">
+              <div className="flex shrink-0 items-center border-r border-gray-200 px-4 text-sm font-bold text-gray-700">
+                {currency}
+              </div>
 
               <input
                 id="budget-amount"
@@ -231,11 +274,21 @@ export default function BudgetModal({
                 value={amount}
                 onChange={(event) => setAmount(event.target.value)}
                 placeholder="0.00"
-                disabled={saving}
-                className="min-w-0 flex-1 rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm outline-none transition focus:border-black focus:bg-white disabled:opacity-50"
+                disabled={saving || currencyLoading}
+                className="min-w-0 flex-1 bg-transparent px-4 py-3 text-sm outline-none disabled:opacity-50"
               />
             </div>
+
+            <p className="mt-2 text-xs text-gray-400">
+              Your account currency is{" "}
+              <span className="font-semibold text-gray-500">
+                {currencyLoading ? "Loading..." : currency}
+              </span>
+              . Change it in Settings if needed.
+            </p>
           </div>
+
+          {/* MONTH */}
 
           <div>
             <label
@@ -255,6 +308,8 @@ export default function BudgetModal({
             />
           </div>
 
+          {/* ACTIONS */}
+
           <div className="flex flex-col-reverse gap-2 pt-2 sm:flex-row sm:justify-end">
             <button
               type="button"
@@ -267,7 +322,14 @@ export default function BudgetModal({
 
             <button
               type="submit"
-              disabled={saving}
+              disabled={
+                saving ||
+                currencyLoading ||
+                !categoryName ||
+                !amount ||
+                !month ||
+                !currency
+              }
               className="rounded-2xl bg-black px-5 py-3 text-sm font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {saving ? "Saving..." : editing ? "Save changes" : "Add budget"}

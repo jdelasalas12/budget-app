@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ChangeEvent } from "react";
 
 import ProtectedRoute from "@/app/components/auth/ProtectedRoute";
 import DashboardNavigation from "@/app/components/dashboard/DashboardNavigation";
@@ -21,65 +21,117 @@ function SettingsContent() {
   const { user } = useAuth();
 
   const [currency, setCurrency] = useState(DEFAULT_CURRENCY);
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
+  /*
+   * Load the user's saved currency.
+   */
   useEffect(() => {
-    async function loadSettings() {
-      if (!user) {
-        return;
-      }
+    if (!user) {
+      setLoading(false);
+      return;
+    }
 
+    let cancelled = false;
+
+    async function loadSettings() {
       try {
         setLoading(true);
         setError("");
 
-        const currentCurrency = await getUserCurrency();
+        const savedCurrency = await getUserCurrency();
 
-        setCurrency(currentCurrency);
+        if (!cancelled) {
+          setCurrency(savedCurrency);
+        }
       } catch (err) {
         console.error("Failed to load settings:", err);
-        setError("Unable to load your settings.");
+
+        if (!cancelled) {
+          setError("Unable to load your settings.");
+          setCurrency(DEFAULT_CURRENCY);
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     }
 
-    loadSettings();
+    void loadSettings();
+
+    return () => {
+      cancelled = true;
+    };
   }, [user]);
 
-  async function handleCurrencyChange(
-    event: React.ChangeEvent<HTMLSelectElement>,
-  ) {
+  async function handleCurrencyChange(event: ChangeEvent<HTMLSelectElement>) {
     const newCurrency = event.target.value;
 
+    /*
+     * Make sure the selected currency actually exists.
+     */
+    const currencyInfo = getCurrency(newCurrency);
+
+    if (!CURRENCIES.some((item) => item.code === currencyInfo.code)) {
+      return;
+    }
+
+    const previousCurrency = currency;
+
+    setCurrency(currencyInfo.code);
     setSaving(true);
     setMessage("");
     setError("");
 
     try {
-      await updateCurrency(newCurrency);
-
-      setCurrency(newCurrency);
-
-      const currencyInfo = getCurrency(newCurrency);
+      await updateCurrency(currencyInfo.code);
 
       setMessage(
         `Currency updated to ${currencyInfo.name} (${currencyInfo.code}).`,
       );
+
+      /*
+       * Notify other components/tabs that the currency changed.
+       *
+       * Components that listen to "currencyChanged" can update
+       * immediately without needing the user to log out/in.
+       */
+      window.dispatchEvent(
+        new CustomEvent("currencyChanged", {
+          detail: {
+            currency: currencyInfo.code,
+          },
+        }),
+      );
+
+      /*
+       * Also notify other browser tabs/windows.
+       */
+      try {
+        localStorage.setItem(
+          "app-currency",
+          JSON.stringify({
+            currency: currencyInfo.code,
+            updatedAt: Date.now(),
+          }),
+        );
+      } catch {
+        // localStorage may be unavailable in some environments.
+      }
     } catch (err) {
       console.error("Failed to update currency:", err);
 
+      /*
+       * Restore the previous value if Firestore update failed.
+       */
+      setCurrency(previousCurrency);
       setError("Unable to update your currency.");
-
-      try {
-        const currentCurrency = await getUserCurrency();
-        setCurrency(currentCurrency);
-      } catch {
-        setCurrency(DEFAULT_CURRENCY);
-      }
     } finally {
       setSaving(false);
     }
@@ -91,7 +143,8 @@ function SettingsContent() {
 
       <main className="min-h-screen md:pl-64">
         <div className="mx-auto max-w-5xl px-4 py-6 pb-28 sm:px-6 sm:py-8 md:pb-8 lg:px-8">
-          {/* Header */}
+          {/* HEADER */}
+
           <div>
             <p className="text-sm text-gray-500">Manage your preferences</p>
 
@@ -104,7 +157,8 @@ function SettingsContent() {
             </p>
           </div>
 
-          {/* Account */}
+          {/* ACCOUNT */}
+
           <section className="mt-6 rounded-3xl bg-white shadow-sm ring-1 ring-black/5">
             <div className="border-b border-gray-100 px-5 py-5 sm:px-6">
               <h2 className="text-lg font-semibold text-gray-900">Account</h2>
@@ -130,20 +184,21 @@ function SettingsContent() {
                   Email
                 </p>
 
-                <p className="mt-1 text-sm font-semibold text-gray-900">
+                <p className="mt-1 break-all text-sm font-semibold text-gray-900">
                   {user?.email || "Not available"}
                 </p>
               </div>
             </div>
           </section>
 
-          {/* Currency */}
+          {/* CURRENCY */}
+
           <section className="mt-4 rounded-3xl bg-white shadow-sm ring-1 ring-black/5">
             <div className="border-b border-gray-100 px-5 py-5 sm:px-6">
               <h2 className="text-lg font-semibold text-gray-900">Currency</h2>
 
               <p className="mt-1 text-sm text-gray-500">
-                Choose the currency used throughout your account.
+                Choose the default currency used throughout your account.
               </p>
             </div>
 
@@ -156,7 +211,7 @@ function SettingsContent() {
               </label>
 
               {loading ? (
-                <div className="h-12 w-full animate-pulse rounded-2xl bg-gray-100" />
+                <div className="h-12 w-full max-w-md animate-pulse rounded-2xl bg-gray-100" />
               ) : (
                 <select
                   id="currency"
@@ -191,7 +246,8 @@ function SettingsContent() {
             </div>
           </section>
 
-          {/* Supported currencies */}
+          {/* SUPPORTED CURRENCIES */}
+
           <section className="mt-4 rounded-3xl bg-white shadow-sm ring-1 ring-black/5">
             <div className="border-b border-gray-100 px-5 py-5 sm:px-6">
               <h2 className="text-lg font-semibold text-gray-900">
@@ -212,13 +268,13 @@ function SettingsContent() {
                     key={item.code}
                     className="flex items-center justify-between px-5 py-4 sm:px-6"
                   >
-                    <div className="flex items-center gap-3">
-                      <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-gray-100 text-sm font-bold text-gray-900">
+                    <div className="flex min-w-0 items-center gap-3">
+                      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gray-100 text-sm font-bold text-gray-900">
                         {item.symbol}
                       </div>
 
-                      <div>
-                        <p className="text-sm font-semibold text-gray-900">
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-gray-900">
                           {item.name}
                         </p>
 
@@ -227,7 +283,7 @@ function SettingsContent() {
                     </div>
 
                     {active && (
-                      <span className="rounded-full bg-black px-3 py-1 text-xs font-semibold text-white">
+                      <span className="shrink-0 rounded-full bg-black px-3 py-1 text-xs font-semibold text-white">
                         Active
                       </span>
                     )}

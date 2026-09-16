@@ -1,7 +1,5 @@
 import {
-  addDoc,
   collection,
-  deleteDoc,
   doc,
   getDocs,
   limit,
@@ -11,11 +9,9 @@ import {
   serverTimestamp,
   startAfter,
   Timestamp,
-  updateDoc,
   where,
   type DocumentSnapshot,
   type QueryConstraint,
-  type Transaction as FirestoreTransaction,
 } from "firebase/firestore";
 
 import { db } from "@/lib/firebase";
@@ -30,29 +26,25 @@ import type {
 
 const TRANSACTIONS_PER_PAGE = 10;
 
+/* =========================================================
+   REFERENCES
+========================================================= */
+
 function transactionsCollection(userId: string) {
   return collection(db, "users", userId, "transactions");
-}
-
-function accountDocument(userId: string, accountId: string) {
-  return doc(db, "users", userId, "accounts", accountId);
 }
 
 function transactionDocument(userId: string, transactionId: string) {
   return doc(db, "users", userId, "transactions", transactionId);
 }
 
-function budgetsCollection(userId: string) {
-  return collection(db, "users", userId, "budgets");
+function accountDocument(userId: string, accountId: string) {
+  return doc(db, "users", userId, "accounts", accountId);
 }
 
-function budgetDocument(userId: string, budgetId: string) {
-  return doc(db, "users", userId, "budgets", budgetId);
-}
-
-function notificationsCollection(userId: string) {
-  return collection(db, "notifications", userId, "items");
-}
+/* =========================================================
+   SEARCH
+========================================================= */
 
 function createSearchKeywords(values: string[]) {
   const keywords = new Set<string>();
@@ -72,121 +64,56 @@ function createSearchKeywords(values: string[]) {
   return Array.from(keywords);
 }
 
+/* =========================================================
+   BALANCE
+========================================================= */
+
 function getBalanceEffect(type: TransactionType, amount: number) {
   return type === "income" ? amount : -amount;
 }
 
-/*
- * Returns the month key used by budgets.
- *
- * Example:
- * 2026-09-16 -> "2026-09"
- */
-function getBudgetMonth(date: Date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
+/* =========================================================
+   MAP TRANSACTION
+========================================================= */
 
-  return `${year}-${month}`;
-}
+function mapTransaction(item: DocumentSnapshot): Transaction {
+  const data = item.data();
 
-/*
- * Recalculate a budget's spent amount from transactions.
- *
- * This makes the budget reliable even when transactions
- * are edited or deleted.
- */
-async function recalculateBudget(
-  userId: string,
-  categoryId: string,
-  month: string,
-  transaction: FirestoreTransaction,
-) {
-  const budgetQuery = query(
-    budgetsCollection(userId),
-    where("categoryId", "==", categoryId),
-    where("month", "==", month),
-    limit(1),
-  );
-
-  const budgetSnapshot = await getDocs(budgetQuery);
-
-  if (budgetSnapshot.empty) {
-    return;
+  if (!data) {
+    throw new Error("Transaction data is missing.");
   }
 
-  const budgetDoc = budgetSnapshot.docs[0];
-
-  const transactionsQuery = query(
-    transactionsCollection(userId),
-    where("categoryId", "==", categoryId),
-  );
-
-  const transactionsSnapshot = await getDocs(transactionsQuery);
-
-  let spent = 0;
-
-  for (const transactionDoc of transactionsSnapshot.docs) {
-    const data = transactionDoc.data();
-
-    if (data.type !== "expense") {
-      continue;
-    }
-
-    const transactionDate = data.date?.toDate?.();
-
-    if (!transactionDate) {
-      continue;
-    }
-
-    if (getBudgetMonth(transactionDate) !== month) {
-      continue;
-    }
-
-    spent += Number(data.amount ?? 0);
-  }
-
-  const budgetAmount = Number(budgetDoc.data().amount ?? 0);
-
-  transaction.update(budgetDocument(userId, budgetDoc.id), {
-    spent,
-    updatedAt: serverTimestamp(),
-  });
-
-  /*
-   * Create notification when the budget is exceeded.
-   *
-   * We create the notification only when the transaction
-   * causes the budget to become overspent.
-   */
-  if (spent > budgetAmount) {
-    const notificationRef = doc(notificationsCollection(userId));
-
-    transaction.set(notificationRef, {
-      userId,
-      type: "budget_overspent",
-      title: "Budget exceeded",
-      message: `You've exceeded your ${budgetDoc.data().categoryName} budget by ${Math.abs(
-        spent - budgetAmount,
-      ).toFixed(2)}.`,
-      budgetId: budgetDoc.id,
-      categoryId,
-      categoryName: budgetDoc.data().categoryName,
-      amount: spent - budgetAmount,
-      currency: budgetDoc.data().currency ?? DEFAULT_CURRENCY,
-      read: false,
-      createdAt: serverTimestamp(),
-    });
-  }
+  return {
+    id: item.id,
+    userId: data.userId,
+    type: data.type,
+    title: data.title,
+    amount: Number(data.amount ?? 0),
+    categoryId: data.categoryId,
+    categoryName: data.categoryName,
+    accountId: data.accountId,
+    accountName: data.accountName,
+    date: data.date,
+    notes: data.notes ?? "",
+    currency: data.currency ?? DEFAULT_CURRENCY,
+    createdAt: data.createdAt,
+    updatedAt: data.updatedAt,
+    searchKeywords: data.searchKeywords ?? [],
+  };
 }
 
 /* =========================================================
-   CREATE TRANSACTION
+   CREATE
 ========================================================= */
 
 export async function createTransaction(
   userId: string,
   input: CreateTransactionInput,
 ) {
+  if (!userId) {
+    throw new Error("You must be signed in.");
+  }
+
   const amount = Number(input.amount);
 
   if (!Number.isFinite(amount) || amount <= 0) {
@@ -197,7 +124,12 @@ export async function createTransaction(
     throw new Error("Please select an account.");
   }
 
+  if (!input.title?.trim()) {
+    throw new Error("Please enter a transaction title.");
+  }
+
   const transactionRef = doc(transactionsCollection(userId));
+
   const accountRef = accountDocument(userId, input.accountId);
 
   const searchKeywords = createSearchKeywords([
@@ -214,11 +146,9 @@ export async function createTransaction(
       throw new Error("The selected account could not be found.");
     }
 
-    const accountData = accountSnapshot.data();
-    const currentBalance = Number(accountData.balance ?? 0);
+    const currentBalance = Number(accountSnapshot.data().balance ?? 0);
 
     const balanceEffect = getBalanceEffect(input.type, amount);
-    const newBalance = currentBalance + balanceEffect;
 
     transaction.set(transactionRef, {
       userId,
@@ -238,25 +168,16 @@ export async function createTransaction(
     });
 
     transaction.update(accountRef, {
-      balance: newBalance,
+      balance: currentBalance + balanceEffect,
       updatedAt: serverTimestamp(),
     });
-
-    /*
-     * Only expenses affect budgets.
-     */
-    if (input.type === "expense") {
-      const month = getBudgetMonth(input.date);
-
-      await recalculateBudget(userId, input.categoryId, month, transaction);
-    }
   });
 
   return transactionRef.id;
 }
 
 /* =========================================================
-   UPDATE TRANSACTION
+   UPDATE
 ========================================================= */
 
 export async function updateTransaction(
@@ -264,6 +185,10 @@ export async function updateTransaction(
   transactionId: string,
   input: UpdateTransactionInput,
 ) {
+  if (!userId) {
+    throw new Error("You must be signed in.");
+  }
+
   const amount = Number(input.amount);
 
   if (!Number.isFinite(amount) || amount <= 0) {
@@ -274,7 +199,12 @@ export async function updateTransaction(
     throw new Error("Please select an account.");
   }
 
+  if (!input.title?.trim()) {
+    throw new Error("Please enter a transaction title.");
+  }
+
   const transactionRef = transactionDocument(userId, transactionId);
+
   const newAccountRef = accountDocument(userId, input.accountId);
 
   const searchKeywords = createSearchKeywords([
@@ -285,26 +215,24 @@ export async function updateTransaction(
   ]);
 
   await runTransaction(db, async (transaction) => {
-    const existingTransactionSnapshot = await transaction.get(transactionRef);
+    const existingSnapshot = await transaction.get(transactionRef);
 
-    if (!existingTransactionSnapshot.exists()) {
+    if (!existingSnapshot.exists()) {
       throw new Error("Transaction not found.");
     }
 
-    const oldData = existingTransactionSnapshot.data();
+    const oldData = existingSnapshot.data();
 
-    const oldAccountId = oldData.accountId as string;
+    const oldAccountId = String(oldData.accountId);
+
     const oldType = oldData.type as TransactionType;
-    const oldAmount = Number(oldData.amount ?? 0);
-    const oldCategoryId = oldData.categoryId as string;
 
-    const oldDate = oldData.date?.toDate?.() ?? new Date();
+    const oldAmount = Number(oldData.amount ?? 0);
 
     const oldAccountRef = accountDocument(userId, oldAccountId);
 
-    /*
-     * Update account balances.
-     */
+    /* SAME ACCOUNT */
+
     if (oldAccountId === input.accountId) {
       const accountSnapshot = await transaction.get(oldAccountRef);
 
@@ -317,16 +245,18 @@ export async function updateTransaction(
       const currentBalance = Number(accountSnapshot.data().balance ?? 0);
 
       const oldEffect = getBalanceEffect(oldType, oldAmount);
+
       const newEffect = getBalanceEffect(input.type, amount);
 
-      const newBalance = currentBalance - oldEffect + newEffect;
-
       transaction.update(oldAccountRef, {
-        balance: newBalance,
+        balance: currentBalance - oldEffect + newEffect,
         updatedAt: serverTimestamp(),
       });
     } else {
+      /* DIFFERENT ACCOUNT */
+
       const oldAccountSnapshot = await transaction.get(oldAccountRef);
+
       const newAccountSnapshot = await transaction.get(newAccountRef);
 
       if (!oldAccountSnapshot.exists()) {
@@ -338,9 +268,11 @@ export async function updateTransaction(
       }
 
       const oldBalance = Number(oldAccountSnapshot.data().balance ?? 0);
+
       const newBalance = Number(newAccountSnapshot.data().balance ?? 0);
 
       const oldEffect = getBalanceEffect(oldType, oldAmount);
+
       const newEffect = getBalanceEffect(input.type, amount);
 
       transaction.update(oldAccountRef, {
@@ -354,9 +286,6 @@ export async function updateTransaction(
       });
     }
 
-    /*
-     * Update the transaction itself.
-     */
     transaction.update(transactionRef, {
       type: input.type,
       title: input.title.trim(),
@@ -371,37 +300,18 @@ export async function updateTransaction(
       updatedAt: serverTimestamp(),
       searchKeywords,
     });
-
-    /*
-     * Recalculate the OLD budget.
-     *
-     * This is important if the user changes:
-     * - category
-     * - month
-     * - expense -> income
-     */
-    if (oldType === "expense") {
-      const oldMonth = getBudgetMonth(oldDate);
-
-      await recalculateBudget(userId, oldCategoryId, oldMonth, transaction);
-    }
-
-    /*
-     * Recalculate the NEW budget.
-     */
-    if (input.type === "expense") {
-      const newMonth = getBudgetMonth(input.date);
-
-      await recalculateBudget(userId, input.categoryId, newMonth, transaction);
-    }
   });
 }
 
 /* =========================================================
-   DELETE TRANSACTION
+   DELETE
 ========================================================= */
 
 export async function deleteTransaction(userId: string, transactionId: string) {
+  if (!userId) {
+    throw new Error("You must be signed in.");
+  }
+
   const transactionRef = transactionDocument(userId, transactionId);
 
   await runTransaction(db, async (transaction) => {
@@ -413,12 +323,11 @@ export async function deleteTransaction(userId: string, transactionId: string) {
 
     const data = transactionSnapshot.data();
 
-    const accountId = data.accountId as string;
-    const type = data.type as TransactionType;
-    const amount = Number(data.amount ?? 0);
-    const categoryId = data.categoryId as string;
+    const accountId = String(data.accountId);
 
-    const transactionDate = data.date?.toDate?.() ?? new Date();
+    const type = data.type as TransactionType;
+
+    const amount = Number(data.amount ?? 0);
 
     const accountRef = accountDocument(userId, accountId);
 
@@ -432,30 +341,19 @@ export async function deleteTransaction(userId: string, transactionId: string) {
 
     const currentBalance = Number(accountSnapshot.data().balance ?? 0);
 
-    const transactionEffect = getBalanceEffect(type, amount);
-
-    const newBalance = currentBalance - transactionEffect;
+    const effect = getBalanceEffect(type, amount);
 
     transaction.update(accountRef, {
-      balance: newBalance,
+      balance: currentBalance - effect,
       updatedAt: serverTimestamp(),
     });
 
     transaction.delete(transactionRef);
-
-    /*
-     * Recalculate budget after deleting an expense.
-     */
-    if (type === "expense") {
-      const month = getBudgetMonth(transactionDate);
-
-      await recalculateBudget(userId, categoryId, month, transaction);
-    }
   });
 }
 
 /* =========================================================
-   NORMAL TRANSACTION PAGINATION
+   NORMAL TRANSACTIONS
 ========================================================= */
 
 export interface TransactionPage {
@@ -475,6 +373,10 @@ export async function getTransactions({
   search?: string;
   lastDocument?: DocumentSnapshot | null;
 }): Promise<TransactionPage> {
+  if (!userId) {
+    throw new Error("You must be signed in.");
+  }
+
   const collectionRef = transactionsCollection(userId);
 
   const constraints: QueryConstraint[] = [];
@@ -507,37 +409,17 @@ export async function getTransactions({
 
   const documents = snapshot.docs.slice(0, TRANSACTIONS_PER_PAGE);
 
-  const transactions: Transaction[] = documents.map((item) => {
-    const data = item.data();
-
-    return {
-      id: item.id,
-      userId: data.userId,
-      type: data.type,
-      title: data.title,
-      amount: Number(data.amount ?? 0),
-      categoryId: data.categoryId,
-      categoryName: data.categoryName,
-      accountId: data.accountId,
-      accountName: data.accountName,
-      date: data.date,
-      notes: data.notes ?? "",
-      currency: data.currency ?? DEFAULT_CURRENCY,
-      createdAt: data.createdAt,
-      updatedAt: data.updatedAt,
-      searchKeywords: data.searchKeywords ?? [],
-    };
-  });
-
   return {
-    transactions,
+    transactions: documents.map(mapTransaction),
+
     lastDocument: documents.length > 0 ? documents[documents.length - 1] : null,
+
     hasMore,
   };
 }
 
 /* =========================================================
-   REPORT TRANSACTION PAGINATION
+   REPORT TRANSACTIONS
 ========================================================= */
 
 export interface ReportTransactionPage {
@@ -557,17 +439,26 @@ export async function getReportTransactions({
   to: Date;
   lastDocument?: DocumentSnapshot | null;
 }): Promise<ReportTransactionPage> {
+  if (!userId) {
+    throw new Error("You must be signed in.");
+  }
+
   const collectionRef = transactionsCollection(userId);
 
   const fromDate = new Date(from);
+
   fromDate.setHours(0, 0, 0, 0);
 
   const toDate = new Date(to);
-  toDate.setHours(23, 59, 59, 999);
+
+  toDate.setDate(toDate.getDate() + 1);
+  toDate.setHours(0, 0, 0, 0);
 
   const constraints: QueryConstraint[] = [
     where("date", ">=", Timestamp.fromDate(fromDate)),
-    where("date", "<=", Timestamp.fromDate(toDate)),
+
+    where("date", "<", Timestamp.fromDate(toDate)),
+
     orderBy("date", "desc"),
   ];
 
@@ -585,31 +476,55 @@ export async function getReportTransactions({
 
   const documents = snapshot.docs.slice(0, TRANSACTIONS_PER_PAGE);
 
-  const transactions: Transaction[] = documents.map((item) => {
-    const data = item.data();
-
-    return {
-      id: item.id,
-      userId: data.userId,
-      type: data.type,
-      title: data.title,
-      amount: Number(data.amount ?? 0),
-      categoryId: data.categoryId,
-      categoryName: data.categoryName,
-      accountId: data.accountId,
-      accountName: data.accountName,
-      date: data.date,
-      notes: data.notes ?? "",
-      currency: data.currency ?? DEFAULT_CURRENCY,
-      createdAt: data.createdAt,
-      updatedAt: data.updatedAt,
-      searchKeywords: data.searchKeywords ?? [],
-    };
-  });
-
   return {
-    transactions,
+    transactions: documents.map(mapTransaction),
+
     lastDocument: documents.length > 0 ? documents[documents.length - 1] : null,
+
     hasMore,
   };
+}
+
+/* =========================================================
+   EXPENSE TRANSACTIONS FOR MONTH
+========================================================= */
+
+export async function getExpenseTransactionsForMonth({
+  userId,
+  from,
+  to,
+}: {
+  userId: string;
+  from: Date;
+  to: Date;
+}): Promise<Transaction[]> {
+  if (!userId) {
+    throw new Error("You must be signed in.");
+  }
+
+  const collectionRef = transactionsCollection(userId);
+
+  const fromDate = new Date(from);
+
+  fromDate.setHours(0, 0, 0, 0);
+
+  const toDate = new Date(to);
+
+  toDate.setHours(23, 59, 59, 999);
+
+  const transactionQuery = query(
+    collectionRef,
+
+    where("type", "==", "expense"),
+
+    where("date", ">=", Timestamp.fromDate(fromDate)),
+
+    where("date", "<=", Timestamp.fromDate(toDate)),
+
+    orderBy("date", "desc"),
+  );
+
+  const snapshot = await getDocs(transactionQuery);
+
+  return snapshot.docs.map(mapTransaction);
 }

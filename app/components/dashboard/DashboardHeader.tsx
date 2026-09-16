@@ -21,6 +21,7 @@ interface NotificationItem {
   message: string;
   read: boolean;
   createdAt: Timestamp | null;
+  level?: "warning" | "limit" | "overspent";
 }
 
 export default function DashboardHeader() {
@@ -36,18 +37,29 @@ export default function DashboardHeader() {
   useEffect(() => {
     if (!user) {
       setNotifications([]);
+      setLoadingNotifications(false);
       return;
     }
 
     setLoadingNotifications(true);
 
-    const notificationsRef = collection(db, "notifications", user.uid, "items");
+    /*
+     * IMPORTANT
+     *
+     * Budget notifications are stored here:
+     *
+     * users/{userId}/notifications/{notificationId}
+     *
+     * This must match subscribeToBudgetNotifications().
+     */
+    const notificationsRef = collection(db, "users", user.uid, "notifications");
 
     /*
-     * Only load the newest 5 notifications.
+     * Load the newest 5 notifications.
      *
-     * This prevents the notification dropdown from becoming
-     * huge even if the user has hundreds of notifications.
+     * Unread notifications stay highlighted.
+     * Reading a notification only changes read=true.
+     * It does NOT remove the notification from the list.
      */
     const notificationsQuery = query(
       notificationsRef,
@@ -61,12 +73,33 @@ export default function DashboardHeader() {
         const items: NotificationItem[] = snapshot.docs.map((item) => {
           const data = item.data();
 
+          let title = "Notification";
+
+          /*
+           * Give budget notifications useful titles.
+           */
+          if (data.level === "overspent") {
+            title = "Budget exceeded";
+          } else if (data.level === "limit") {
+            title = "Budget limit reached";
+          } else if (data.level === "warning") {
+            title = "Budget warning";
+          } else if (typeof data.title === "string") {
+            title = data.title;
+          }
+
           return {
             id: item.id,
-            title: typeof data.title === "string" ? data.title : "Notification",
+            title,
             message: typeof data.message === "string" ? data.message : "",
             read: data.read === true,
             createdAt: data.createdAt ?? null,
+            level:
+              data.level === "warning" ||
+              data.level === "limit" ||
+              data.level === "overspent"
+                ? data.level
+                : undefined,
           };
         });
 
@@ -75,6 +108,7 @@ export default function DashboardHeader() {
       },
       (error) => {
         console.error("Unable to load notifications:", error);
+
         setNotifications([]);
         setLoadingNotifications(false);
       },
@@ -96,17 +130,33 @@ export default function DashboardHeader() {
     }
 
     try {
+      /*
+       * IMPORTANT
+       *
+       * Update the same document that the notification
+       * listener is reading:
+       *
+       * users/{userId}/notifications/{notificationId}
+       */
       const notificationRef = doc(
         db,
-        "notifications",
+        "users",
         user.uid,
-        "items",
+        "notifications",
         notification.id,
       );
 
       await updateDoc(notificationRef, {
         read: true,
+        updatedAt: new Date(),
       });
+
+      /*
+       * onSnapshot will automatically update the UI.
+       *
+       * The notification remains visible but is no longer
+       * highlighted.
+       */
     } catch (error) {
       console.error("Unable to mark notification as read:", error);
     }
@@ -125,6 +175,34 @@ export default function DashboardHeader() {
       hour: "numeric",
       minute: "2-digit",
     });
+  }
+
+  function getNotificationStyle(notification: NotificationItem) {
+    if (notification.read) {
+      return {
+        container: "bg-white",
+        dot: "bg-gray-200",
+      };
+    }
+
+    if (notification.level === "overspent") {
+      return {
+        container: "bg-red-50",
+        dot: "bg-red-500",
+      };
+    }
+
+    if (notification.level === "limit") {
+      return {
+        container: "bg-amber-50",
+        dot: "bg-amber-500",
+      };
+    }
+
+    return {
+      container: "bg-blue-50/70",
+      dot: "bg-blue-500",
+    };
   }
 
   return (
@@ -176,9 +254,7 @@ export default function DashboardHeader() {
                 </p>
               </div>
 
-              {notifications.length > 0 && (
-                <span className="text-xs text-gray-400">Latest 5</span>
-              )}
+              <span className="text-xs text-gray-400">Latest 5</span>
             </div>
 
             {/* Notifications */}
@@ -200,62 +276,62 @@ export default function DashboardHeader() {
                   </p>
                 </div>
               ) : (
-                notifications.map((notification) => (
-                  <button
-                    key={notification.id}
-                    type="button"
-                    onClick={() => handleNotificationClick(notification)}
-                    className={`block w-full border-b border-gray-100 px-4 py-3 text-left transition hover:bg-gray-50 ${
-                      !notification.read ? "bg-blue-50/70" : "bg-white"
-                    }`}
-                  >
-                    <div className="flex gap-3">
-                      {/* Unread indicator */}
-                      <div className="pt-1.5">
-                        <span
-                          className={`block h-2.5 w-2.5 rounded-full ${
-                            notification.read ? "bg-gray-200" : "bg-blue-500"
-                          }`}
-                        />
-                      </div>
+                notifications.map((notification) => {
+                  const style = getNotificationStyle(notification);
 
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-start justify-between gap-2">
-                          <p
-                            className={`text-sm ${
-                              notification.read
-                                ? "font-medium text-gray-700"
-                                : "font-bold text-gray-950"
-                            }`}
-                          >
-                            {notification.title}
-                          </p>
-
-                          {!notification.read && (
-                            <span className="shrink-0 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-600">
-                              New
-                            </span>
-                          )}
+                  return (
+                    <button
+                      key={notification.id}
+                      type="button"
+                      onClick={() => handleNotificationClick(notification)}
+                      className={`block w-full border-b border-gray-100 px-4 py-3 text-left transition hover:bg-gray-50 ${style.container}`}
+                    >
+                      <div className="flex gap-3">
+                        {/* Unread indicator */}
+                        <div className="pt-1.5">
+                          <span
+                            className={`block h-2.5 w-2.5 rounded-full ${style.dot}`}
+                          />
                         </div>
 
-                        <p className="mt-1 text-xs leading-5 text-gray-500">
-                          {notification.message}
-                        </p>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-start justify-between gap-2">
+                            <p
+                              className={`text-sm ${
+                                notification.read
+                                  ? "font-medium text-gray-700"
+                                  : "font-bold text-gray-950"
+                              }`}
+                            >
+                              {notification.title}
+                            </p>
 
-                        {notification.createdAt && (
-                          <p className="mt-1.5 text-[10px] text-gray-400">
-                            {formatNotificationDate(notification.createdAt)}
+                            {!notification.read && (
+                              <span className="shrink-0 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-600">
+                                New
+                              </span>
+                            )}
+                          </div>
+
+                          <p className="mt-1 text-xs leading-5 text-gray-500">
+                            {notification.message}
                           </p>
-                        )}
+
+                          {notification.createdAt && (
+                            <p className="mt-1.5 text-[10px] text-gray-400">
+                              {formatNotificationDate(notification.createdAt)}
+                            </p>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  </button>
-                ))
+                    </button>
+                  );
+                })
               )}
             </div>
 
             {/* Footer */}
-            {notifications.length >= 5 && (
+            {notifications.length > 0 && (
               <div className="border-t border-gray-100 px-4 py-2.5 text-center">
                 <p className="text-xs text-gray-400">
                   Showing your 5 most recent notifications

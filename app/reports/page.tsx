@@ -1,7 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DocumentSnapshot } from "firebase/firestore";
 
 import ProtectedRoute from "@/app/components/auth/ProtectedRoute";
@@ -24,15 +23,15 @@ function formatDateForInput(date: Date) {
 }
 
 function getStartOfMonth() {
-  const date = new Date();
+  const now = new Date();
 
-  return new Date(date.getFullYear(), date.getMonth(), 1);
+  return new Date(now.getFullYear(), now.getMonth(), 1);
 }
 
 function getEndOfToday() {
-  const date = new Date();
+  const now = new Date();
 
-  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
 }
 
 export default function ReportsPage() {
@@ -46,50 +45,77 @@ export default function ReportsPage() {
 function ReportsContent() {
   const { user } = useAuth();
 
-  const [fromDate, setFromDate] = useState(
-    formatDateForInput(getStartOfMonth()),
-  );
+  const defaultFrom = useMemo(() => formatDateForInput(getStartOfMonth()), []);
 
-  const [toDate, setToDate] = useState(formatDateForInput(getEndOfToday()));
+  const defaultTo = useMemo(() => formatDateForInput(getEndOfToday()), []);
 
-  const [appliedFromDate, setAppliedFromDate] = useState(
-    formatDateForInput(getStartOfMonth()),
-  );
+  const [fromDate, setFromDate] = useState(defaultFrom);
+  const [toDate, setToDate] = useState(defaultTo);
 
-  const [appliedToDate, setAppliedToDate] = useState(
-    formatDateForInput(getEndOfToday()),
-  );
+  const [appliedFromDate, setAppliedFromDate] = useState(defaultFrom);
+  const [appliedToDate, setAppliedToDate] = useState(defaultTo);
 
   const [transactions, setTransactions] = useState<Transaction[]>([]);
 
-  const [loading, setLoading] = useState(true);
-
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
   const [page, setPage] = useState(1);
-
   const [hasMore, setHasMore] = useState(false);
 
-  const [lastDocument, setLastDocument] = useState<DocumentSnapshot | null>(
-    null,
-  );
-
+  /*
+   * Cursor used for each page.
+   *
+   * pageCursors[0] = null
+   * pageCursors[1] = cursor needed to load page 2
+   * pageCursors[2] = cursor needed to load page 3
+   */
   const [pageCursors, setPageCursors] = useState<(DocumentSnapshot | null)[]>([
     null,
   ]);
 
-  const loadReport = useCallback(
-    async (cursor: DocumentSnapshot | null) => {
+  /*
+   * Keep the request counter outside React state.
+   *
+   * Changing this value does NOT cause a render.
+   */
+  const requestIdRef = useRef(0);
+
+  /*
+   * Prevent multiple pagination requests from
+   * being fired at the same time.
+   */
+  const loadingRef = useRef(false);
+
+  /*
+   * Fetch a report page.
+   */
+  const fetchPage = useCallback(
+    async (cursor: DocumentSnapshot | null, targetPage: number) => {
       if (!user) {
         return;
       }
 
+      /*
+       * Every request gets its own ID.
+       */
+      const requestId = ++requestIdRef.current;
+
+      loadingRef.current = true;
       setLoading(true);
       setError("");
 
       try {
         const from = new Date(`${appliedFromDate}T00:00:00`);
+
+        /*
+         * Keep the selected "To" date inclusive.
+         *
+         * The Firestore function should ideally treat this
+         * as an exclusive upper bound.
+         */
         const to = new Date(`${appliedToDate}T00:00:00`);
+        to.setDate(to.getDate() + 1);
 
         if (from > to) {
           throw new Error("The From date cannot be later than the To date.");
@@ -102,36 +128,78 @@ function ReportsContent() {
           lastDocument: cursor,
         });
 
+        /*
+         * Ignore stale requests.
+         */
+        if (requestId !== requestIdRef.current) {
+          return;
+        }
+
         setTransactions(result.transactions);
         setHasMore(result.hasMore);
-        setLastDocument(result.lastDocument);
+        setPage(targetPage);
+
+        /*
+         * Store the cursor returned by Firestore.
+         */
+        if (result.lastDocument) {
+          setPageCursors((current) => {
+            const next = [...current];
+
+            next[targetPage] = result.lastDocument;
+
+            return next;
+          });
+        }
       } catch (err) {
+        if (requestId !== requestIdRef.current) {
+          return;
+        }
+
         console.error("Unable to load report:", err);
 
-        if (err instanceof Error) {
-          setError(err.message);
-        } else {
-          setError("Unable to load your report.");
-        }
+        setError(
+          err instanceof Error ? err.message : "Unable to load your report.",
+        );
       } finally {
-        setLoading(false);
+        if (requestId === requestIdRef.current) {
+          loadingRef.current = false;
+          setLoading(false);
+        }
       }
     },
     [user, appliedFromDate, appliedToDate],
   );
 
+  /*
+   * Load the first page whenever:
+   *
+   * - the user changes
+   * - the applied date range changes
+   */
   useEffect(() => {
     if (!user) {
+      requestIdRef.current += 1;
+
+      setTransactions([]);
+      setHasMore(false);
+      setPage(1);
+      setPageCursors([null]);
+      setLoading(false);
+
       return;
     }
 
+    /*
+     * Reset pagination immediately.
+     */
     setPage(1);
     setPageCursors([null]);
 
-    loadReport(null);
-  }, [user, appliedFromDate, appliedToDate, loadReport]);
+    fetchPage(null, 1);
+  }, [user, appliedFromDate, appliedToDate, fetchPage]);
 
-  function handleApply() {
+  const handleApply = useCallback(() => {
     const from = new Date(`${fromDate}T00:00:00`);
     const to = new Date(`${toDate}T00:00:00`);
 
@@ -141,52 +209,73 @@ function ReportsContent() {
     }
 
     setError("");
-    setAppliedFromDate(fromDate);
-    setAppliedToDate(toDate);
-  }
 
-  function handleClear() {
-    const defaultFrom = formatDateForInput(getStartOfMonth());
-    const defaultTo = formatDateForInput(getEndOfToday());
-
-    setFromDate(defaultFrom);
-    setToDate(defaultTo);
-    setAppliedFromDate(defaultFrom);
-    setAppliedToDate(defaultTo);
-    setPage(1);
-    setPageCursors([null]);
-  }
-
-  async function handleNextPage() {
-    if (!hasMore || !lastDocument) {
+    if (fromDate === appliedFromDate && toDate === appliedToDate) {
       return;
     }
 
-    const currentLastDocument = lastDocument;
+    setAppliedFromDate(fromDate ? fromDate.toString().slice(0, 10) : "");
+    setAppliedToDate(toDate ? toDate.toString().slice(0, 10) : "");
+  }, [fromDate, toDate, appliedFromDate, appliedToDate]);
 
-    setPageCursors((current) => {
-      const next = [...current];
-      next[page] = currentLastDocument;
-      return next;
-    });
+  const handleClear = useCallback(() => {
+    const nextFrom = formatDateForInput(getStartOfMonth());
+    const nextTo = formatDateForInput(getEndOfToday());
 
-    setPage((current) => current + 1);
+    setFromDate(nextFrom);
+    setToDate(nextTo);
+    setError("");
 
-    await loadReport(currentLastDocument);
-  }
-
-  async function handlePreviousPage() {
-    if (page <= 1) {
+    if (nextFrom === appliedFromDate && nextTo === appliedToDate) {
       return;
     }
 
-    const previousCursor = pageCursors[page - 2] ?? null;
+    setAppliedFromDate(nextFrom);
+    setAppliedToDate(nextTo);
+  }, [appliedFromDate, appliedToDate]);
 
-    setPage((current) => current - 1);
+  const handleNextPage = useCallback(async () => {
+    if (!user || loadingRef.current || !hasMore) {
+      return;
+    }
 
-    await loadReport(previousCursor);
-  }
+    const nextPage = page + 1;
 
+    /*
+     * pageCursors[page] contains the cursor returned
+     * from the current page.
+     */
+    const cursor = pageCursors[page];
+
+    if (!cursor) {
+      return;
+    }
+
+    await fetchPage(cursor, nextPage);
+  }, [user, hasMore, page, pageCursors, fetchPage]);
+
+  const handlePreviousPage = useCallback(async () => {
+    if (!user || loadingRef.current || page <= 1) {
+      return;
+    }
+
+    const previousPage = page - 1;
+
+    /*
+     * Page 1 always starts at null.
+     *
+     * For page N, we need the cursor that starts
+     * page N.
+     */
+    const cursor =
+      previousPage === 1 ? null : (pageCursors[previousPage - 1] ?? null);
+
+    await fetchPage(cursor, previousPage);
+  }, [user, page, pageCursors, fetchPage]);
+
+  /*
+   * Summary for currently loaded page.
+   */
   const stats = useMemo(() => {
     let income = 0;
     let expenses = 0;
@@ -206,6 +295,9 @@ function ReportsContent() {
     };
   }, [transactions]);
 
+  /*
+   * Spending by category.
+   */
   const categoryBreakdown = useMemo(() => {
     const categories = new Map<string, number>();
 
@@ -214,9 +306,10 @@ function ReportsContent() {
         continue;
       }
 
-      const current = categories.get(transaction.categoryName) ?? 0;
-
-      categories.set(transaction.categoryName, current + transaction.amount);
+      categories.set(
+        transaction.categoryName,
+        (categories.get(transaction.categoryName) ?? 0) + transaction.amount,
+      );
     }
 
     return Array.from(categories.entries())
@@ -227,6 +320,9 @@ function ReportsContent() {
       .sort((a, b) => b.amount - a.amount);
   }, [transactions]);
 
+  /*
+   * Activity by account.
+   */
   const accountBreakdown = useMemo(() => {
     const accounts = new Map<
       string,
@@ -237,18 +333,18 @@ function ReportsContent() {
     >();
 
     for (const transaction of transactions) {
-      const existing = accounts.get(transaction.accountName) ?? {
+      const current = accounts.get(transaction.accountName) ?? {
         income: 0,
         expenses: 0,
       };
 
       if (transaction.type === "income") {
-        existing.income += transaction.amount;
+        current.income += transaction.amount;
       } else {
-        existing.expenses += transaction.amount;
+        current.expenses += transaction.amount;
       }
 
-      accounts.set(transaction.accountName, existing);
+      accounts.set(transaction.accountName, current);
     }
 
     return Array.from(accounts.entries())
@@ -268,8 +364,6 @@ function ReportsContent() {
 
       <main className="min-h-screen md:pl-64">
         <div className="mx-auto max-w-7xl px-4 py-6 pb-28 sm:px-6 sm:py-8 md:pb-8 lg:px-8">
-          {/* HEADER */}
-
           <div>
             <p className="text-sm text-gray-500">Understand your finances</p>
 
@@ -333,15 +427,17 @@ function ReportsContent() {
               <button
                 type="button"
                 onClick={handleApply}
-                className="rounded-2xl bg-black px-5 py-3 text-sm font-semibold text-white transition hover:bg-gray-800"
+                disabled={loading}
+                className="rounded-2xl bg-black px-5 py-3 text-sm font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Apply
+                {loading ? "Loading..." : "Apply"}
               </button>
 
               <button
                 type="button"
                 onClick={handleClear}
-                className="rounded-2xl border border-gray-200 bg-white px-5 py-3 text-sm font-semibold text-gray-700 transition hover:bg-gray-50"
+                disabled={loading}
+                className="rounded-2xl border border-gray-200 bg-white px-5 py-3 text-sm font-semibold text-gray-700 transition hover:bg-gray-50 disabled:opacity-50"
               >
                 Clear
               </button>
@@ -361,8 +457,6 @@ function ReportsContent() {
             </div>
           </section>
 
-          {/* ERROR */}
-
           {error && (
             <div className="mt-4 rounded-2xl bg-red-50 px-4 py-3 text-sm text-red-600">
               {error}
@@ -379,14 +473,14 @@ function ReportsContent() {
                 <SummaryCard
                   title="Income"
                   value={formatCurrency(stats.income, currency)}
-                  description="Selected period"
+                  description="Loaded report transactions"
                   color="green"
                 />
 
                 <SummaryCard
                   title="Expenses"
                   value={formatCurrency(stats.expenses, currency)}
-                  description="Selected period"
+                  description="Loaded report transactions"
                   color="red"
                 />
 
@@ -398,7 +492,7 @@ function ReportsContent() {
                 />
               </div>
 
-              {/* SPENDING BY CATEGORY */}
+              {/* CATEGORY */}
 
               <section className="mt-4 rounded-3xl bg-white shadow-sm ring-1 ring-black/5">
                 <div className="border-b border-gray-100 px-5 py-5 sm:px-6">
@@ -519,7 +613,7 @@ function ReportsContent() {
                   </h2>
 
                   <p className="mt-1 text-sm text-gray-500">
-                    Transactions on this report page.
+                    Transactions in this report period.
                   </p>
                 </div>
 
@@ -663,7 +757,7 @@ function ReportTransactionRow({ transaction }: { transaction: Transaction }) {
 }
 
 /* =========================================================
-   EMPTY
+   EMPTY STATE
 ========================================================= */
 
 function EmptyReport({ text }: { text: string }) {
@@ -694,6 +788,8 @@ function ReportsLoading() {
       <div className="mt-4 h-80 animate-pulse rounded-3xl bg-white" />
 
       <div className="mt-4 h-64 animate-pulse rounded-3xl bg-white" />
+
+      <div className="mt-4 h-96 animate-pulse rounded-3xl bg-white" />
     </div>
   );
 }

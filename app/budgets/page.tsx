@@ -13,11 +13,11 @@ import {
   updateBudget,
 } from "@/lib/firestore/budgets";
 
-import { getTransactions } from "@/lib/firestore/transactions";
-import { formatCurrency } from "@/lib/currency";
+import { getExpenseTransactionsForMonth } from "@/lib/firestore/transactions";
+import { getUserCurrency } from "@/lib/auth";
+import { DEFAULT_CURRENCY, formatCurrency } from "@/lib/currency";
 
 import type { Budget, CreateBudgetInput } from "@/types/budget";
-
 import type { Transaction } from "@/types/transaction";
 
 const categories = [
@@ -37,6 +37,30 @@ function getCurrentMonth() {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 }
 
+function getMonthRange(month: string) {
+  const [year, monthNumber] = month.split("-").map(Number);
+
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(monthNumber) ||
+    monthNumber < 1 ||
+    monthNumber > 12
+  ) {
+    throw new Error("Invalid month.");
+  }
+
+  const from = new Date(year, monthNumber - 1, 1);
+  const to = new Date(year, monthNumber, 1);
+
+  from.setHours(0, 0, 0, 0);
+  to.setHours(0, 0, 0, 0);
+
+  return {
+    from,
+    to,
+  };
+}
+
 export default function BudgetsPage() {
   return (
     <ProtectedRoute>
@@ -51,6 +75,8 @@ function BudgetsContent() {
   const [budgets, setBudgets] = useState<Budget[]>([]);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
 
+  const [currency, setCurrency] = useState(DEFAULT_CURRENCY);
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -59,11 +85,14 @@ function BudgetsContent() {
   const [month, setMonth] = useState(getCurrentMonth());
 
   const [modalOpen, setModalOpen] = useState(false);
-
   const [editingBudget, setEditingBudget] = useState<Budget | null>(null);
 
   const loadData = useCallback(async () => {
     if (!user) {
+      setBudgets([]);
+      setTransactions([]);
+      setCurrency(DEFAULT_CURRENCY);
+      setLoading(false);
       return;
     }
 
@@ -71,13 +100,23 @@ function BudgetsContent() {
       setLoading(true);
       setError("");
 
-      const [budgetData, transactionData] = await Promise.all([
+      const { from, to } = getMonthRange(month);
+
+      const [budgetData, transactionData, userCurrency] = await Promise.all([
         getBudgets(user.uid),
-        getAllTransactions(user.uid),
+
+        getExpenseTransactionsForMonth({
+          userId: user.uid,
+          from,
+          to,
+        }),
+
+        getUserCurrency(),
       ]);
 
       setBudgets(budgetData);
       setTransactions(transactionData);
+      setCurrency(userCurrency || DEFAULT_CURRENCY);
     } catch (error) {
       console.error("Unable to load budgets:", error);
 
@@ -85,67 +124,91 @@ function BudgetsContent() {
     } finally {
       setLoading(false);
     }
-  }, [user]);
+  }, [user, month]);
 
   useEffect(() => {
-    loadData();
+    void loadData();
   }, [loadData]);
 
+  /*
+   * Calculate spending by category AND currency.
+   *
+   * This prevents PHP transactions from being counted
+   * against an SAR budget, for example.
+   */
+  const spendingByCategory = useMemo(() => {
+    const totals = new Map<string, number>();
+
+    for (const transaction of transactions) {
+      if (transaction.type !== "expense") {
+        continue;
+      }
+
+      if (!transaction.categoryId) {
+        continue;
+      }
+
+      const amount = Number(transaction.amount ?? 0);
+
+      if (!Number.isFinite(amount)) {
+        continue;
+      }
+
+      const transactionCurrency = transaction.currency || DEFAULT_CURRENCY;
+
+      const key = `${transaction.categoryId}__${transactionCurrency}`;
+
+      totals.set(key, (totals.get(key) ?? 0) + amount);
+    }
+
+    return totals;
+  }, [transactions]);
+
+  /*
+   * Attach calculated spending to each budget.
+   */
   const budgetsForMonth = useMemo(() => {
     return budgets
       .filter((budget) => budget.month === month)
       .map((budget) => {
-        const spent = transactions
-          .filter((transaction) => {
-            if (transaction.type !== "expense") {
-              return false;
-            }
+        const budgetCurrency = budget.currency || DEFAULT_CURRENCY;
 
-            if (transaction.categoryId !== budget.categoryId) {
-              return false;
-            }
-
-            const date = transaction.date?.toDate?.();
-
-            if (!date) {
-              return false;
-            }
-
-            const transactionMonth = `${date.getFullYear()}-${String(
-              date.getMonth() + 1,
-            ).padStart(2, "0")}`;
-
-            return transactionMonth === budget.month;
-          })
-          .reduce(
-            (total, transaction) => total + Number(transaction.amount ?? 0),
-            0,
-          );
+        const key = `${budget.categoryId}__${budgetCurrency}`;
 
         return {
           ...budget,
-          spent,
+          currency: budgetCurrency,
+          spent: spendingByCategory.get(key) ?? 0,
         };
       });
-  }, [budgets, transactions, month]);
+  }, [budgets, month, spendingByCategory]);
 
+  /*
+   * Summary only includes budgets in the user's
+   * current default currency.
+   *
+   * We do not convert between currencies without
+   * an exchange-rate system.
+   */
   const summary = useMemo(() => {
-    const totalBudget = budgetsForMonth.reduce(
-      (total, budget) => total + budget.amount,
-      0,
-    );
+    let totalBudget = 0;
+    let totalSpent = 0;
 
-    const totalSpent = budgetsForMonth.reduce(
-      (total, budget) => total + budget.spent,
-      0,
-    );
+    for (const budget of budgetsForMonth) {
+      if (budget.currency !== currency) {
+        continue;
+      }
+
+      totalBudget += Number(budget.amount ?? 0);
+      totalSpent += Number(budget.spent ?? 0);
+    }
 
     return {
       totalBudget,
       totalSpent,
       remaining: totalBudget - totalSpent,
     };
-  }, [budgetsForMonth]);
+  }, [budgetsForMonth, currency]);
 
   async function handleSave(input: CreateBudgetInput) {
     if (!user) {
@@ -158,16 +221,26 @@ function BudgetsContent() {
 
       if (editingBudget) {
         await updateBudget(user.uid, editingBudget.id, input);
+
+        /*
+         * Reload after editing so the calculated spending
+         * and currency are guaranteed to be current.
+         */
+        const updatedBudgets = await getBudgets(user.uid);
+
+        setBudgets(updatedBudgets);
       } else {
         await createBudget(user.uid, input);
+
+        const updatedBudgets = await getBudgets(user.uid);
+
+        setBudgets(updatedBudgets);
       }
 
       setModalOpen(false);
       setEditingBudget(null);
-
-      await loadData();
     } catch (error) {
-      console.error(error);
+      console.error("Unable to save budget:", error);
 
       setError(
         error instanceof Error ? error.message : "Unable to save the budget.",
@@ -195,9 +268,9 @@ function BudgetsContent() {
 
       await deleteBudget(user.uid, budget.id);
 
-      await loadData();
+      setBudgets((current) => current.filter((item) => item.id !== budget.id));
     } catch (error) {
-      console.error(error);
+      console.error("Unable to delete budget:", error);
 
       setError("Unable to delete the budget.");
     }
@@ -211,6 +284,15 @@ function BudgetsContent() {
   function openEditModal(budget: Budget) {
     setEditingBudget(budget);
     setModalOpen(true);
+  }
+
+  function closeModal() {
+    if (saving) {
+      return;
+    }
+
+    setModalOpen(false);
+    setEditingBudget(null);
   }
 
   return (
@@ -259,7 +341,8 @@ function BudgetsContent() {
                 type="month"
                 value={month}
                 onChange={(event) => setMonth(event.target.value)}
-                className="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm outline-none focus:border-black focus:bg-white"
+                disabled={loading}
+                className="rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 text-sm outline-none transition focus:border-black focus:bg-white disabled:cursor-not-allowed disabled:opacity-60"
               />
             </div>
           </section>
@@ -272,6 +355,8 @@ function BudgetsContent() {
             </div>
           )}
 
+          {/* CONTENT */}
+
           {loading ? (
             <LoadingState />
           ) : (
@@ -280,29 +365,20 @@ function BudgetsContent() {
 
               <div className="mt-4 grid gap-4 sm:grid-cols-3">
                 <SummaryCard
-                  title="Total budget"
-                  value={formatCurrency(
-                    summary.totalBudget,
-                    budgetsForMonth[0]?.currency ?? "PHP",
-                  )}
+                  title={`Total budget (${currency})`}
+                  value={formatCurrency(summary.totalBudget, currency)}
                   color="blue"
                 />
 
                 <SummaryCard
-                  title="Total spent"
-                  value={formatCurrency(
-                    summary.totalSpent,
-                    budgetsForMonth[0]?.currency ?? "PHP",
-                  )}
+                  title={`Total spent (${currency})`}
+                  value={formatCurrency(summary.totalSpent, currency)}
                   color="red"
                 />
 
                 <SummaryCard
-                  title="Remaining"
-                  value={formatCurrency(
-                    summary.remaining,
-                    budgetsForMonth[0]?.currency ?? "PHP",
-                  )}
+                  title={`Remaining (${currency})`}
+                  value={formatCurrency(summary.remaining, currency)}
                   color={summary.remaining >= 0 ? "green" : "red"}
                 />
               </div>
@@ -311,14 +387,22 @@ function BudgetsContent() {
 
               <section className="mt-4 rounded-3xl bg-white shadow-sm ring-1 ring-black/5">
                 <div className="border-b border-gray-100 px-5 py-5 sm:px-6">
-                  <h2 className="text-lg font-semibold text-gray-900">
-                    Your budgets
-                  </h2>
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <h2 className="text-lg font-semibold text-gray-900">
+                        Your budgets
+                      </h2>
 
-                  <p className="mt-1 text-sm text-gray-500">
-                    Spending is calculated automatically from your expense
-                    transactions.
-                  </p>
+                      <p className="mt-1 text-sm text-gray-500">
+                        Spending is calculated automatically from your expense
+                        transactions.
+                      </p>
+                    </div>
+
+                    <span className="w-fit rounded-full bg-gray-100 px-3 py-1 text-xs font-semibold text-gray-600">
+                      Default: {currency}
+                    </span>
+                  </div>
                 </div>
 
                 {budgetsForMonth.length === 0 ? (
@@ -338,7 +422,7 @@ function BudgetsContent() {
                     <button
                       type="button"
                       onClick={openAddModal}
-                      className="mt-5 rounded-2xl bg-black px-5 py-3 text-sm font-semibold text-white"
+                      className="mt-5 rounded-2xl bg-black px-5 py-3 text-sm font-semibold text-white transition hover:bg-gray-800"
                     >
                       + Add budget
                     </button>
@@ -346,27 +430,34 @@ function BudgetsContent() {
                 ) : (
                   <div className="divide-y divide-gray-100">
                     {budgetsForMonth.map((budget) => {
+                      const amount = Number(budget.amount ?? 0);
+
+                      const spent = Number(budget.spent ?? 0);
+
                       const percentage =
-                        budget.amount > 0
-                          ? (budget.spent / budget.amount) * 100
-                          : 0;
+                        amount > 0 ? (spent / amount) * 100 : 0;
 
-                      const remaining = budget.amount - budget.spent;
+                      const remaining = amount - spent;
 
-                      const overBudget = budget.spent > budget.amount;
+                      const overBudget = spent > amount;
 
                       return (
                         <div key={budget.id} className="px-5 py-5 sm:px-6">
                           <div className="flex items-start justify-between gap-4">
                             <div className="min-w-0">
-                              <h3 className="truncate font-semibold text-gray-900">
-                                {budget.categoryName}
-                              </h3>
+                              <div className="flex items-center gap-2">
+                                <h3 className="truncate font-semibold text-gray-900">
+                                  {budget.categoryName}
+                                </h3>
+
+                                <span className="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-bold text-gray-500">
+                                  {budget.currency}
+                                </span>
+                              </div>
 
                               <p className="mt-1 text-xs text-gray-500">
-                                {formatCurrency(budget.spent, budget.currency)}{" "}
-                                spent of{" "}
-                                {formatCurrency(budget.amount, budget.currency)}
+                                {formatCurrency(spent, budget.currency)} spent
+                                of {formatCurrency(amount, budget.currency)}
                               </p>
                             </div>
 
@@ -374,7 +465,7 @@ function BudgetsContent() {
                               <button
                                 type="button"
                                 onClick={() => openEditModal(budget)}
-                                className="text-xs font-medium text-gray-500 hover:text-black"
+                                className="text-xs font-medium text-gray-500 transition hover:text-black"
                               >
                                 Edit
                               </button>
@@ -382,7 +473,7 @@ function BudgetsContent() {
                               <button
                                 type="button"
                                 onClick={() => handleDelete(budget)}
-                                className="text-xs font-medium text-red-500 hover:text-red-700"
+                                className="text-xs font-medium text-red-500 transition hover:text-red-700"
                               >
                                 Delete
                               </button>
@@ -399,7 +490,10 @@ function BudgetsContent() {
                                     : "bg-black"
                               }`}
                               style={{
-                                width: `${Math.min(percentage, 100)}%`,
+                                width: `${Math.min(
+                                  Math.max(percentage, 0),
+                                  100,
+                                )}%`,
                               }}
                             />
                           </div>
@@ -448,13 +542,9 @@ function BudgetsContent() {
         open={modalOpen}
         budget={editingBudget}
         month={month}
+        defaultCurrency={currency}
         saving={saving}
-        onClose={() => {
-          if (!saving) {
-            setModalOpen(false);
-            setEditingBudget(null);
-          }
-        }}
+        onClose={closeModal}
         onSave={handleSave}
       />
     </div>
@@ -462,34 +552,7 @@ function BudgetsContent() {
 }
 
 /* =========================================================
-   LOAD ALL TRANSACTIONS
-========================================================= */
-
-async function getAllTransactions(userId: string): Promise<Transaction[]> {
-  const transactions: Transaction[] = [];
-
-  let lastDocument: any = null;
-
-  while (true) {
-    const result = await getTransactions({
-      userId,
-      lastDocument,
-    });
-
-    transactions.push(...result.transactions);
-
-    if (!result.hasMore || !result.lastDocument) {
-      break;
-    }
-
-    lastDocument = result.lastDocument;
-  }
-
-  return transactions;
-}
-
-/* =========================================================
-   SUMMARY
+   SUMMARY CARD
 ========================================================= */
 
 function SummaryCard({
@@ -530,6 +593,7 @@ function BudgetModal({
   open,
   budget,
   month,
+  defaultCurrency,
   saving,
   onClose,
   onSave,
@@ -537,34 +601,46 @@ function BudgetModal({
   open: boolean;
   budget: Budget | null;
   month: string;
+  defaultCurrency: string;
   saving: boolean;
   onClose: () => void;
   onSave: (input: CreateBudgetInput) => Promise<void>;
 }) {
-  const { user } = useAuth();
-
   const [categoryId, setCategoryId] = useState("Food");
   const [amount, setAmount] = useState("");
   const [budgetMonth, setBudgetMonth] = useState(month);
-  const [currency, setCurrency] = useState("PHP");
+  const [currency, setCurrency] = useState(defaultCurrency);
+
+  const [validationError, setValidationError] = useState("");
 
   useEffect(() => {
     if (!open) {
       return;
     }
 
+    setValidationError("");
+
     if (budget) {
       setCategoryId(budget.categoryId);
       setAmount(String(budget.amount));
       setBudgetMonth(budget.month);
-      setCurrency(budget.currency);
+
+      /*
+       * Existing budgets keep their saved currency.
+       */
+      setCurrency(budget.currency || defaultCurrency);
     } else {
       setCategoryId("Food");
       setAmount("");
       setBudgetMonth(month);
-      setCurrency("PHP");
+
+      /*
+       * New budgets ALWAYS use the currency
+       * selected in Settings.
+       */
+      setCurrency(defaultCurrency);
     }
-  }, [open, budget, month]);
+  }, [open, budget, month, defaultCurrency]);
 
   if (!open) {
     return null;
@@ -573,17 +649,31 @@ function BudgetModal({
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
+    setValidationError("");
+
     const selectedCategory = categories.find(
       (category) => category === categoryId,
     );
 
     if (!selectedCategory) {
+      setValidationError("Please select a category.");
       return;
     }
 
     const numericAmount = Number(amount);
 
     if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      setValidationError("Budget amount must be greater than zero.");
+      return;
+    }
+
+    if (!budgetMonth) {
+      setValidationError("Please select a month.");
+      return;
+    }
+
+    if (!currency) {
+      setValidationError("Please select a currency.");
       return;
     }
 
@@ -601,7 +691,7 @@ function BudgetModal({
       <div className="w-full rounded-t-3xl bg-white p-5 shadow-2xl sm:max-w-lg sm:rounded-3xl sm:p-6">
         <div className="mb-6 flex items-center justify-between">
           <div>
-            <h2 className="text-xl font-bold">
+            <h2 className="text-xl font-bold text-gray-950">
               {budget ? "Edit Budget" : "Add Budget"}
             </h2>
 
@@ -614,20 +704,36 @@ function BudgetModal({
             type="button"
             onClick={onClose}
             disabled={saving}
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-gray-100 text-xl text-gray-500 hover:bg-gray-200"
+            aria-label="Close"
+            className="flex h-10 w-10 items-center justify-center rounded-full bg-gray-100 text-xl text-gray-500 transition hover:bg-gray-200 disabled:opacity-50"
           >
             ×
           </button>
         </div>
 
+        {validationError && (
+          <div className="mb-4 rounded-2xl bg-red-50 px-4 py-3 text-sm text-red-600">
+            {validationError}
+          </div>
+        )}
+
         <form onSubmit={handleSubmit} className="space-y-5">
+          {/* CATEGORY */}
+
           <div>
-            <label className="mb-2 block text-sm font-medium">Category</label>
+            <label
+              htmlFor="budget-category"
+              className="mb-2 block text-sm font-medium text-gray-700"
+            >
+              Category
+            </label>
 
             <select
+              id="budget-category"
               value={categoryId}
               onChange={(event) => setCategoryId(event.target.value)}
-              className="w-full rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 outline-none focus:border-black focus:bg-white"
+              disabled={saving}
+              className="w-full rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 outline-none transition focus:border-black focus:bg-white disabled:opacity-60"
             >
               {categories.map((category) => (
                 <option key={category} value={category}>
@@ -637,23 +743,23 @@ function BudgetModal({
             </select>
           </div>
 
+          {/* AMOUNT */}
+
           <div>
-            <label className="mb-2 block text-sm font-medium">
+            <label
+              htmlFor="budget-amount"
+              className="mb-2 block text-sm font-medium text-gray-700"
+            >
               Budget amount
             </label>
 
             <div className="flex overflow-hidden rounded-2xl border border-gray-200 bg-gray-50 focus-within:border-black">
-              <select
-                value={currency}
-                onChange={(event) => setCurrency(event.target.value)}
-                className="border-r border-gray-200 bg-transparent px-3 text-sm font-semibold outline-none"
-              >
-                <option value="PHP">PHP</option>
-                <option value="SAR">SAR</option>
-                <option value="USD">USD</option>
-              </select>
+              <div className="flex items-center border-r border-gray-200 bg-gray-100 px-4 text-sm font-bold text-gray-700">
+                {currency}
+              </div>
 
               <input
+                id="budget-amount"
                 type="number"
                 min="0.01"
                 step="0.01"
@@ -661,37 +767,54 @@ function BudgetModal({
                 onChange={(event) => setAmount(event.target.value)}
                 placeholder="0.00"
                 required
-                className="min-w-0 flex-1 bg-transparent px-4 py-3 outline-none"
+                disabled={saving}
+                className="min-w-0 flex-1 bg-transparent px-4 py-3 outline-none disabled:opacity-60"
               />
             </div>
+
+            <p className="mt-2 text-xs text-gray-400">
+              New budgets use your default currency from Settings:{" "}
+              <span className="font-semibold">{defaultCurrency}</span>
+            </p>
           </div>
 
+          {/* MONTH */}
+
           <div>
-            <label className="mb-2 block text-sm font-medium">Month</label>
+            <label
+              htmlFor="budget-month"
+              className="mb-2 block text-sm font-medium text-gray-700"
+            >
+              Month
+            </label>
 
             <input
+              id="budget-month"
               type="month"
               value={budgetMonth}
               onChange={(event) => setBudgetMonth(event.target.value)}
               required
-              className="w-full rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 outline-none focus:border-black focus:bg-white"
+              disabled={saving}
+              className="w-full rounded-2xl border border-gray-200 bg-gray-50 px-4 py-3 outline-none transition focus:border-black focus:bg-white disabled:opacity-60"
             />
           </div>
+
+          {/* BUTTONS */}
 
           <div className="flex gap-3 pt-2">
             <button
               type="button"
               onClick={onClose}
               disabled={saving}
-              className="flex-1 rounded-2xl border border-gray-200 px-4 py-3 font-semibold hover:bg-gray-50"
+              className="flex-1 rounded-2xl border border-gray-200 px-4 py-3 font-semibold text-gray-700 transition hover:bg-gray-50 disabled:opacity-50"
             >
               Cancel
             </button>
 
             <button
               type="submit"
-              disabled={saving || !user || !amount || !budgetMonth}
-              className="flex-1 rounded-2xl bg-black px-4 py-3 font-semibold text-white hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={saving || !amount || !budgetMonth || !currency}
+              className="flex-1 rounded-2xl bg-black px-4 py-3 font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {saving ? "Saving..." : budget ? "Save changes" : "Add budget"}
             </button>

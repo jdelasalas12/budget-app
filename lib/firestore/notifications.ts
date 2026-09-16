@@ -28,6 +28,7 @@ export interface BudgetNotification {
   currency: string;
   read: boolean;
   createdAt?: unknown;
+  updatedAt?: unknown;
 }
 
 interface BudgetData {
@@ -48,6 +49,14 @@ interface TransactionData {
   date: {
     toDate?: () => Date;
   } | null;
+}
+
+function budgetsCollection(userId: string) {
+  return collection(db, "users", userId, "budgets");
+}
+
+function transactionsCollection(userId: string) {
+  return collection(db, "users", userId, "transactions");
 }
 
 function notificationsCollection(userId: string) {
@@ -82,206 +91,81 @@ function getNotificationLevel(
   return null;
 }
 
+function createMessage(
+  budget: BudgetData,
+  spent: number,
+  percentage: number,
+  level: BudgetNotificationLevel,
+) {
+  if (level === "overspent") {
+    return `${budget.categoryName} budget is overspent. You have spent ${formatCurrency(
+      spent,
+      budget.currency,
+    )} of ${formatCurrency(budget.amount, budget.currency)}.`;
+  }
+
+  if (level === "limit") {
+    return `${budget.categoryName} budget limit reached. You have spent ${formatCurrency(
+      spent,
+      budget.currency,
+    )} of ${formatCurrency(budget.amount, budget.currency)}.`;
+  }
+
+  return `${budget.categoryName} budget is ${Math.round(
+    percentage,
+  )}% used. You have spent ${formatCurrency(
+    spent,
+    budget.currency,
+  )} of ${formatCurrency(budget.amount, budget.currency)}.`;
+}
+
 /**
- * Listen to the user's budgets and transactions in real time.
+ * Subscribe to the user's current-month budgets and transactions.
  *
- * Whenever either collection changes, budget notifications
- * are recalculated immediately.
+ * This function GENERATES budget notifications in:
+ *
+ * users/{userId}/notifications
+ *
+ * The notification UI can subscribe to that collection separately.
  */
 export function subscribeToBudgetNotifications(
   userId: string,
-  callback: (notifications: BudgetNotification[]) => void,
   onError?: (error: Error) => void,
 ): Unsubscribe {
   const month = getCurrentMonth();
 
-  const budgetsRef = collection(db, "users", userId, "budgets");
-
-  const transactionsRef = collection(db, "users", userId, "transactions");
-
-  const notificationsRef = collection(db, "users", userId, "notifications");
-
   let budgets: BudgetData[] = [];
   let transactions: TransactionData[] = [];
-  let storedNotifications: BudgetNotification[] = [];
 
   let budgetsLoaded = false;
   let transactionsLoaded = false;
-  let notificationsLoaded = false;
 
-  let unsubscribeBudgets: Unsubscribe | null = null;
-  let unsubscribeTransactions: Unsubscribe | null = null;
-  let unsubscribeNotifications: Unsubscribe | null = null;
+  let recalculating = false;
 
-  function recalculate() {
-    if (!budgetsLoaded || !transactionsLoaded || !notificationsLoaded) {
-      return;
-    }
+  const budgetsQuery = query(
+    budgetsCollection(userId),
+    where("month", "==", month),
+  );
 
-    const generated: BudgetNotification[] = [];
-
-    for (const budget of budgets) {
-      if (!Number.isFinite(budget.amount) || budget.amount <= 0) {
-        continue;
-      }
-
-      let spent = 0;
-
-      for (const transaction of transactions) {
-        if (transaction.type !== "expense") {
-          continue;
-        }
-
-        const matchesCategory =
-          transaction.categoryId === budget.categoryId ||
-          transaction.categoryName === budget.categoryName;
-
-        if (!matchesCategory) {
-          continue;
-        }
-
-        const transactionDate = transaction.date?.toDate?.();
-
-        if (!transactionDate) {
-          continue;
-        }
-
-        const transactionMonth = `${transactionDate.getFullYear()}-${String(
-          transactionDate.getMonth() + 1,
-        ).padStart(2, "0")}`;
-
-        if (transactionMonth !== budget.month) {
-          continue;
-        }
-
-        spent += transaction.amount;
-      }
-
-      const percentage = (spent / budget.amount) * 100;
-
-      const level = getNotificationLevel(percentage);
-
-      if (!level) {
-        continue;
-      }
-
-      const notificationId = `${budget.id}-${level}`;
-
-      const existing = storedNotifications.find(
-        (notification) => notification.id === notificationId,
-      );
-
-      let message = "";
-
-      if (level === "overspent") {
-        message = `${budget.categoryName} budget is overspent. You have spent ${formatCurrency(
-          spent,
-          budget.currency,
-        )} of ${formatCurrency(budget.amount, budget.currency)}.`;
-      } else if (level === "limit") {
-        message = `${budget.categoryName} budget limit reached. You have spent ${formatCurrency(
-          spent,
-          budget.currency,
-        )} of ${formatCurrency(budget.amount, budget.currency)}.`;
-      } else {
-        message = `${budget.categoryName} budget is ${Math.round(
-          percentage,
-        )}% used. You have spent ${formatCurrency(
-          spent,
-          budget.currency,
-        )} of ${formatCurrency(budget.amount, budget.currency)}.`;
-      }
-
-      generated.push({
-        id: notificationId,
-        userId,
-        budgetId: budget.id,
-        categoryId: budget.categoryId,
-        categoryName: budget.categoryName,
-        level,
-        message,
-        spent,
-        budgetAmount: budget.amount,
-        percentage,
-        currency: budget.currency,
-        read: existing?.read ?? false,
-        createdAt: existing?.createdAt,
-      });
-    }
-
-    /*
-     * Save/update notifications in Firestore.
-     */
-    for (const notification of generated) {
-      const notificationRef = notificationDocument(userId, notification.id);
-
-      void setDoc(
-        notificationRef,
-        {
-          userId: notification.userId,
-          budgetId: notification.budgetId,
-          categoryId: notification.categoryId,
-          categoryName: notification.categoryName,
-          level: notification.level,
-          message: notification.message,
-          spent: notification.spent,
-          budgetAmount: notification.budgetAmount,
-          percentage: notification.percentage,
-          currency: notification.currency,
-          read: notification.read,
-          createdAt: notification.createdAt ?? new Date(),
-          updatedAt: new Date(),
-        },
-        {
-          merge: true,
-        },
-      );
-    }
-
-    /*
-     * Remove old notifications when the budget is
-     * no longer at the warning threshold.
-     *
-     * Example:
-     *
-     * 80% -> notification exists
-     * transaction deleted -> 70%
-     * notification is removed.
-     */
-    const generatedIds = new Set(
-      generated.map((notification) => notification.id),
-    );
-
-    for (const existing of storedNotifications) {
-      if (!generatedIds.has(existing.id)) {
-        void deleteDoc(notificationDocument(userId, existing.id));
-      }
-    }
-
-    /*
-     * Return only unread notifications to the UI.
-     */
-    callback(generated.filter((notification) => !notification.read));
-  }
-
-  unsubscribeBudgets = onSnapshot(
-    query(budgetsRef, where("month", "==", month)),
+  const unsubscribeBudgets = onSnapshot(
+    budgetsQuery,
     (snapshot) => {
       budgets = snapshot.docs.map((item) => {
         const data = item.data();
 
         return {
           id: item.id,
-          categoryId: data.categoryId ?? "",
-          categoryName: data.categoryName ?? "Unknown",
+          categoryId: String(data.categoryId ?? ""),
+          categoryName: String(data.categoryName ?? "Unknown"),
           amount: Number(data.amount ?? 0),
-          month: data.month ?? month,
-          currency: data.currency ?? "PHP",
+          month: String(data.month ?? month),
+          currency: String(data.currency ?? "PHP"),
         };
       });
 
       budgetsLoaded = true;
-      recalculate();
+
+      void recalculate();
     },
     (error) => {
       console.error("Budget notification listener error:", error);
@@ -290,24 +174,25 @@ export function subscribeToBudgetNotifications(
     },
   );
 
-  unsubscribeTransactions = onSnapshot(
-    transactionsRef,
+  const unsubscribeTransactions = onSnapshot(
+    transactionsCollection(userId),
     (snapshot) => {
       transactions = snapshot.docs.map((item) => {
         const data = item.data();
 
         return {
-          type: data.type ?? "",
+          type: String(data.type ?? ""),
           amount: Number(data.amount ?? 0),
-          categoryId: data.categoryId ?? "",
-          categoryName: data.categoryName ?? "",
-          currency: data.currency ?? "PHP",
+          categoryId: String(data.categoryId ?? ""),
+          categoryName: String(data.categoryName ?? ""),
+          currency: String(data.currency ?? "PHP"),
           date: data.date ?? null,
         };
       });
 
       transactionsLoaded = true;
-      recalculate();
+
+      void recalculate();
     },
     (error) => {
       console.error("Transaction notification listener error:", error);
@@ -316,43 +201,201 @@ export function subscribeToBudgetNotifications(
     },
   );
 
-  unsubscribeNotifications = onSnapshot(
-    notificationsRef,
-    (snapshot) => {
-      storedNotifications = snapshot.docs.map((item) => {
-        const data = item.data();
+  async function recalculate() {
+    if (!budgetsLoaded || !transactionsLoaded || recalculating) {
+      return;
+    }
 
-        return {
-          id: item.id,
-          userId: data.userId ?? userId,
-          budgetId: data.budgetId ?? "",
-          categoryId: data.categoryId ?? "",
-          categoryName: data.categoryName ?? "",
-          level: data.level ?? "warning",
-          message: data.message ?? "",
-          spent: Number(data.spent ?? 0),
-          budgetAmount: Number(data.budgetAmount ?? 0),
-          percentage: Number(data.percentage ?? 0),
-          currency: data.currency ?? "PHP",
-          read: Boolean(data.read),
-          createdAt: data.createdAt,
-        };
+    recalculating = true;
+
+    try {
+      const generatedIds = new Set<string>();
+
+      for (const budget of budgets) {
+        if (!Number.isFinite(budget.amount) || budget.amount <= 0) {
+          continue;
+        }
+
+        let spent = 0;
+
+        for (const transaction of transactions) {
+          if (transaction.type !== "expense") {
+            continue;
+          }
+
+          if (!Number.isFinite(transaction.amount)) {
+            continue;
+          }
+
+          /*
+           * Match category.
+           */
+          const matchesCategory =
+            transaction.categoryId === budget.categoryId ||
+            transaction.categoryName === budget.categoryName;
+
+          if (!matchesCategory) {
+            continue;
+          }
+
+          /*
+           * IMPORTANT:
+           *
+           * Do not combine different currencies.
+           */
+          if (transaction.currency !== budget.currency) {
+            continue;
+          }
+
+          const transactionDate = transaction.date?.toDate?.();
+
+          if (!transactionDate) {
+            continue;
+          }
+
+          const transactionMonth = `${transactionDate.getFullYear()}-${String(
+            transactionDate.getMonth() + 1,
+          ).padStart(2, "0")}`;
+
+          if (transactionMonth !== budget.month) {
+            continue;
+          }
+
+          spent += transaction.amount;
+        }
+
+        const percentage = (spent / budget.amount) * 100;
+
+        const level = getNotificationLevel(percentage);
+
+        /*
+         * Below 80%.
+         *
+         * Remove all possible notifications for
+         * this budget.
+         */
+        if (!level) {
+          await deleteDoc(
+            notificationDocument(userId, `${budget.id}-warning`),
+          ).catch(() => {});
+
+          await deleteDoc(
+            notificationDocument(userId, `${budget.id}-limit`),
+          ).catch(() => {});
+
+          await deleteDoc(
+            notificationDocument(userId, `${budget.id}-overspent`),
+          ).catch(() => {});
+
+          continue;
+        }
+
+        const notificationId = `${budget.id}-${level}`;
+
+        generatedIds.add(notificationId);
+
+        /*
+         * Read the existing notification directly.
+         *
+         * We intentionally DO NOT listen to notifications
+         * here. This prevents a notification write from
+         * triggering another calculation loop.
+         */
+        const notificationRef = notificationDocument(userId, notificationId);
+
+        /*
+         * Preserve read status by using merge.
+         *
+         * If this is a brand-new notification,
+         * read defaults to false.
+         */
+        const message = createMessage(budget, spent, percentage, level);
+
+        await setDoc(
+          notificationRef,
+          {
+            userId,
+            budgetId: budget.id,
+            categoryId: budget.categoryId,
+            categoryName: budget.categoryName,
+            level,
+            message,
+            spent,
+            budgetAmount: budget.amount,
+            percentage,
+            currency: budget.currency,
+            read: false,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+          {
+            merge: true,
+          },
+        );
+      }
+
+      /*
+       * Clean up notification levels that are no longer
+       * applicable.
+       *
+       * We use a separate one-time snapshot so the generator
+       * itself does not continuously listen to notifications.
+       */
+      const notificationSnapshot = await new Promise<{
+        docs: Array<{
+          id: string;
+        }>;
+      }>((resolve, reject) => {
+        const unsubscribe = onSnapshot(
+          notificationsCollection(userId),
+          (snapshot) => {
+            unsubscribe();
+            resolve({
+              docs: snapshot.docs.map((item) => ({
+                id: item.id,
+              })),
+            });
+          },
+          (error) => {
+            unsubscribe();
+            reject(error);
+          },
+        );
       });
 
-      notificationsLoaded = true;
-      recalculate();
-    },
-    (error) => {
-      console.error("Notification listener error:", error);
+      for (const notification of notificationSnapshot.docs) {
+        /*
+         * Only delete budget notifications generated by
+         * this system.
+         */
+        if (
+          notification.id.endsWith("-warning") ||
+          notification.id.endsWith("-limit") ||
+          notification.id.endsWith("-overspent")
+        ) {
+          if (!generatedIds.has(notification.id)) {
+            await deleteDoc(
+              notificationDocument(userId, notification.id),
+            ).catch(() => {});
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Unable to recalculate budget notifications:", error);
 
-      onError?.(error);
-    },
-  );
+      onError?.(
+        error instanceof Error
+          ? error
+          : new Error("Unable to calculate budget notifications."),
+      );
+    } finally {
+      recalculating = false;
+    }
+  }
 
   return () => {
-    unsubscribeBudgets?.();
-    unsubscribeTransactions?.();
-    unsubscribeNotifications?.();
+    unsubscribeBudgets();
+    unsubscribeTransactions();
   };
 }
 
@@ -376,7 +419,7 @@ export async function markNotificationAsRead(
 }
 
 /**
- * Delete a notification completely.
+ * Delete one notification completely.
  */
 export async function deleteNotification(
   userId: string,
