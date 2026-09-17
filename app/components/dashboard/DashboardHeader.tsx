@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { usePathname } from "next/navigation";
 import {
   collection,
   limit,
@@ -26,41 +27,39 @@ interface NotificationItem {
 
 export default function DashboardHeader() {
   const { user } = useAuth();
+  const pathname = usePathname();
 
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [showNotifications, setShowNotifications] = useState(false);
   const [loadingNotifications, setLoadingNotifications] = useState(false);
 
+  /*
+
+Used to detect clicks outside the notification
+
+button + dropdown.
+*/
+  const notificationRef = useRef<HTMLDivElement | null>(null);
+
   const name =
     user?.displayName?.trim() || user?.email?.split("@")[0] || "User";
+
+  /* =========================================================
+LOAD NOTIFICATIONS
+========================================================= */
 
   useEffect(() => {
     if (!user) {
       setNotifications([]);
       setLoadingNotifications(false);
+      setShowNotifications(false);
       return;
     }
 
     setLoadingNotifications(true);
 
-    /*
-     * IMPORTANT
-     *
-     * Budget notifications are stored here:
-     *
-     * users/{userId}/notifications/{notificationId}
-     *
-     * This must match subscribeToBudgetNotifications().
-     */
     const notificationsRef = collection(db, "users", user.uid, "notifications");
 
-    /*
-     * Load the newest 5 notifications.
-     *
-     * Unread notifications stay highlighted.
-     * Reading a notification only changes read=true.
-     * It does NOT remove the notification from the list.
-     */
     const notificationsQuery = query(
       notificationsRef,
       orderBy("createdAt", "desc"),
@@ -75,9 +74,6 @@ export default function DashboardHeader() {
 
           let title = "Notification";
 
-          /*
-           * Give budget notifications useful titles.
-           */
           if (data.level === "overspent") {
             title = "Budget exceeded";
           } else if (data.level === "limit") {
@@ -117,27 +113,94 @@ export default function DashboardHeader() {
     return unsubscribe;
   }, [user]);
 
-  /*
-   * Only unread notifications affect the red badge.
-   */
+  /* =========================================================
+CLOSE WHEN NAVIGATING
+========================================================= */
+
+  useEffect(() => {
+    /*
+     * pathname changes whenever Next.js navigation occurs.
+     *
+     * Close the notification dropdown automatically.
+     */
+    setShowNotifications(false);
+  }, [pathname]);
+
+  /* =========================================================
+CLOSE WHEN CLICKING OUTSIDE
+========================================================= */
+
+  useEffect(() => {
+    if (!showNotifications) {
+      return;
+    }
+
+    function handleClickOutside(event: MouseEvent) {
+      const target = event.target as Node;
+
+      if (
+        notificationRef.current &&
+        !notificationRef.current.contains(target)
+      ) {
+        setShowNotifications(false);
+      }
+    }
+
+    document.addEventListener("mousedown", handleClickOutside);
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [showNotifications]);
+
+  /* =========================================================
+ESCAPE KEY
+========================================================= */
+
+  useEffect(() => {
+    if (!showNotifications) {
+      return;
+    }
+
+    function handleEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setShowNotifications(false);
+      }
+    }
+
+    document.addEventListener("keydown", handleEscape);
+
+    return () => {
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [showNotifications]);
+
+  /* =========================================================
+UNREAD COUNT
+========================================================= */
+
   const unreadCount = notifications.filter(
     (notification) => !notification.read,
   ).length;
 
+  /* =========================================================
+NOTIFICATION CLICK
+========================================================= */
+
   async function handleNotificationClick(notification: NotificationItem) {
+    /*
+     * Close immediately when the notification is clicked.
+     */
+    setShowNotifications(false);
+
+    /*
+     * Already read — nothing else to do.
+     */
     if (!user || notification.read) {
       return;
     }
 
     try {
-      /*
-       * IMPORTANT
-       *
-       * Update the same document that the notification
-       * listener is reading:
-       *
-       * users/{userId}/notifications/{notificationId}
-       */
       const notificationRef = doc(
         db,
         "users",
@@ -150,17 +213,14 @@ export default function DashboardHeader() {
         read: true,
         updatedAt: new Date(),
       });
-
-      /*
-       * onSnapshot will automatically update the UI.
-       *
-       * The notification remains visible but is no longer
-       * highlighted.
-       */
     } catch (error) {
       console.error("Unable to mark notification as read:", error);
     }
   }
+
+  /* =========================================================
+DATE
+========================================================= */
 
   function formatNotificationDate(timestamp: Timestamp | null) {
     if (!timestamp) {
@@ -176,6 +236,10 @@ export default function DashboardHeader() {
       minute: "2-digit",
     });
   }
+
+  /* =========================================================
+NOTIFICATION STYLE
+========================================================= */
 
   function getNotificationStyle(notification: NotificationItem) {
     if (notification.read) {
@@ -207,10 +271,14 @@ export default function DashboardHeader() {
 
   return (
     <header className="relative flex items-center justify-between gap-4">
-      <div>
+      {/* =====================================================
+HEADER TEXT
+====================================================== */}
+
+      <div className="min-w-0">
         <p className="text-sm font-medium text-gray-500">Good day</p>
 
-        <h1 className="mt-1 text-2xl font-bold tracking-tight text-gray-950 sm:text-3xl">
+        <h1 className="mt-1 truncate text-2xl font-bold tracking-tight text-gray-950 sm:text-3xl">
           {name}
         </h1>
 
@@ -219,18 +287,26 @@ export default function DashboardHeader() {
         </p>
       </div>
 
-      {/* Notification button + dropdown */}
-      <div className="relative">
+      {/* =====================================================
+      NOTIFICATION
+  ====================================================== */}
+
+      <div ref={notificationRef} className="relative shrink-0">
+        {/* BELL */}
+
         <button
           type="button"
           aria-label="Notifications"
           aria-expanded={showNotifications}
           onClick={() => setShowNotifications((current) => !current)}
-          className="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-white shadow-sm ring-1 ring-black/5 transition hover:bg-gray-50"
+          className={`relative flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-white shadow-sm ring-1 ring-black/5 transition ${
+            showNotifications ? "bg-gray-100" : "hover:bg-gray-50"
+          }`}
         >
           <span className="text-lg">🔔</span>
 
-          {/* Unread badge */}
+          {/* UNREAD BADGE */}
+
           {unreadCount > 0 && (
             <span className="absolute -right-1 -top-1 flex min-h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white ring-2 ring-[#f5f5f7]">
               {unreadCount > 9 ? "9+" : unreadCount}
@@ -238,9 +314,14 @@ export default function DashboardHeader() {
           )}
         </button>
 
+        {/* =================================================
+        DROPDOWN
+    ================================================== */}
+
         {showNotifications && (
           <div className="absolute right-0 top-14 z-50 w-[min(380px,calc(100vw-2rem))] overflow-hidden rounded-2xl bg-white shadow-xl ring-1 ring-black/10">
-            {/* Header */}
+            {/* HEADER */}
+
             <div className="flex items-center justify-between border-b border-gray-100 px-4 py-3">
               <div>
                 <h2 className="text-sm font-bold text-gray-900">
@@ -257,7 +338,8 @@ export default function DashboardHeader() {
               <span className="text-xs text-gray-400">Latest 5</span>
             </div>
 
-            {/* Notifications */}
+            {/* NOTIFICATIONS */}
+
             <div className="max-h-[420px] overflow-y-auto">
               {loadingNotifications ? (
                 <div className="px-4 py-8 text-center text-sm text-gray-500">
@@ -287,12 +369,15 @@ export default function DashboardHeader() {
                       className={`block w-full border-b border-gray-100 px-4 py-3 text-left transition hover:bg-gray-50 ${style.container}`}
                     >
                       <div className="flex gap-3">
-                        {/* Unread indicator */}
+                        {/* DOT */}
+
                         <div className="pt-1.5">
                           <span
                             className={`block h-2.5 w-2.5 rounded-full ${style.dot}`}
                           />
                         </div>
+
+                        {/* CONTENT */}
 
                         <div className="min-w-0 flex-1">
                           <div className="flex items-start justify-between gap-2">
@@ -330,7 +415,8 @@ export default function DashboardHeader() {
               )}
             </div>
 
-            {/* Footer */}
+            {/* FOOTER */}
+
             {notifications.length > 0 && (
               <div className="border-t border-gray-100 px-4 py-2.5 text-center">
                 <p className="text-xs text-gray-400">
