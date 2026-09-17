@@ -528,3 +528,36 @@ export async function getExpenseTransactionsForMonth({
 
   return snapshot.docs.map(mapTransaction);
 }
+
+export async function getTransactionsForMonth({
+  userId,
+  from,
+  to,
+}: {
+  userId: string;
+  from: Date;
+  to: Date;
+}): Promise<Transaction[]> {
+  if (!userId) {
+    throw new Error("You must be signed in.");
+  }
+
+  const collectionRef = transactionsCollection(userId);
+
+  const fromDate = new Date(from);
+  fromDate.setHours(0, 0, 0, 0);
+
+  const toDate = new Date(to);
+  toDate.setHours(23, 59, 59, 999);
+
+  const transactionQuery = query(
+    collectionRef,
+    where("date", ">=", Timestamp.fromDate(fromDate)),
+    where("date", "<=", Timestamp.fromDate(toDate)),
+    orderBy("date", "desc"),
+  );
+
+  const snapshot = await getDocs(transactionQuery);
+
+  return snapshot.docs.map(mapTransaction);
+}
